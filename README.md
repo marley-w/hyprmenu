@@ -15,6 +15,9 @@ HyprMenu is a simple GTK-based application launcher designed for use with Hyprla
 - **pkg-config** (for dependency management)
 - **libsysinfo** (for system information)
 
+
+-  sudo chmod 777 ~/hyprmenu 
+
 - ./hyprmenu or put it as a hotkey in hyprland
 
 - Example ---> bind = $mainMod, Space, exec, ~/hyprmenu
