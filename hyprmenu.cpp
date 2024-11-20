@@ -1,305 +1,265 @@
-// file: hyprmenu.cpp
-#include <gtk/gtk.h>
+// File: hyprfiles.cpp
+
+#include <gtkmm.h>
+#include <filesystem>
 #include <iostream>
-#include <unistd.h>  // for fork(), execlp()
-#include <sys/wait.h>
-#include <cstring>  // for strcat
-#include <string>   // for std::string
-#include <sstream>  // for std::stringstream
-#include <sys/sysinfo.h>  // for sysinfo
-#include <sys/utsname.h>  // for uname
+#include <optional>
 
-// Function to get basic system information
-std::string get_system_info() {
-    std::stringstream info;
+namespace fs = std::filesystem;
 
-    // Get CPU and OS information
-    struct utsname uname_data;
-    if (uname(&uname_data) == 0) {
-        info << "OS: " << uname_data.sysname << " " << uname_data.release << "\n";
-        info << "Machine: " << uname_data.machine << "\n";
-    } else {
-        info << "OS: Unknown\n";
-    }
+class HyprFilesWindow : public Gtk::Window {
+public:
+    HyprFilesWindow();
 
-    // Get memory information
-    struct sysinfo memInfo;
-    sysinfo(&memInfo);
-    long long totalRam = memInfo.totalram;
-    totalRam = totalRam / (1024 * 1024);  // Convert to MB
-    info << "Total RAM: " << totalRam << " MB\n";
+private:
+    // UI Elements
+    Gtk::Box main_box;
+    Gtk::Box left_box;
+    Gtk::Box right_box;
+    Gtk::ListBox quick_access_list;
+    Gtk::TreeView file_view;
+    Gtk::ScrolledWindow scrolled_window;
+    Gtk::Button paste_dead_space;
+    Glib::RefPtr<Gtk::ListStore> file_list_store;
 
-    return info.str();
-}
+    // Clipboard
+    std::optional<fs::path> clipboard_path;
+    std::string clipboard_action; // "copy" or "cut"
 
-// Function to launch applications independently using fork and exec
-void launch_app(const char *app) {
-    pid_t pid = fork();  // Create a new process
-    if (pid == 0) {
-        // Child process: execute the application
-        execlp(app, app, (char *)NULL);
-        _exit(EXIT_FAILURE);  // Exit child if exec fails
-    } else if (pid > 0) {
-        // Parent process: do nothing, just return to GTK main loop
-    } else {
-        std::cerr << "Fork failed!" << std::endl;
-    }
-}
+    // File navigation
+    std::string current_directory;
+    bool show_hidden_files = false;
 
-// Function to launch terminal-based vim using fork and exec
-void edit_config(const char *config_file) {
-    pid_t pid = fork();  // Create a new process
-    if (pid == 0) {
-        // Child process: run kitty or gnome-terminal
-        
-        // Get the home directory path
-        const char *home_dir = getenv("HOME");
-        if (home_dir == NULL) {
-            std::cerr << "Could not get HOME environment variable" << std::endl;
-            _exit(EXIT_FAILURE);
+    // File list
+    void load_directory(const std::string& path);
+    void update_file_view();
+    void on_quick_access_item_selected(Gtk::ListBoxRow* row);
+    void on_file_row_activated(const Gtk::TreeModel::Path& path, Gtk::TreeViewColumn* column);
+
+    // Context Menu
+    Gtk::Menu context_menu;
+    void setup_context_menu();
+    void on_menu_copy();
+    void on_menu_cut();
+    void on_menu_paste();
+    void on_menu_undo();
+    void on_menu_toggle_hidden();
+
+    // Dead Space Click
+    void on_dead_space_paste();
+
+    // Columns for TreeView
+    class FileColumns : public Gtk::TreeModel::ColumnRecord {
+    public:
+        FileColumns() {
+            add(col_icon);
+            add(col_name);
+            add(col_is_dir);
         }
 
-        // Construct the full path to the config file
-        std::string full_path = std::string(home_dir) + "/" + config_file;
+        Gtk::TreeModelColumn<Glib::RefPtr<Gdk::Pixbuf>> col_icon;
+        Gtk::TreeModelColumn<std::string> col_name;
+        Gtk::TreeModelColumn<bool> col_is_dir;
+    };
 
-        // Use kitty or fallback to gnome-terminal
-        if (execlp("kitty", "kitty", "-e", "vim", full_path.c_str(), (char *)NULL) == -1) {
-            execlp("gnome-terminal", "gnome-terminal", "--", "vim", full_path.c_str(), (char *)NULL);
+    FileColumns file_columns;
+};
+
+HyprFilesWindow::HyprFilesWindow()
+    : main_box(Gtk::ORIENTATION_HORIZONTAL, 5),
+      left_box(Gtk::ORIENTATION_VERTICAL, 5),
+      right_box(Gtk::ORIENTATION_VERTICAL, 5),
+      paste_dead_space("Paste Here"),
+      current_directory(fs::current_path()) {
+    set_title("HyprFiles - File Manager");
+    set_default_size(800, 600);
+
+    // Set up main box
+    add(main_box);
+    main_box.pack_start(left_box, Gtk::PACK_SHRINK);
+    main_box.pack_start(right_box, Gtk::PACK_EXPAND_WIDGET);
+
+    // Quick Access Menu
+    Gtk::Label* home_label = Gtk::manage(new Gtk::Label("Home"));
+    Gtk::Label* pictures_label = Gtk::manage(new Gtk::Label("Pictures"));
+    Gtk::Label* root_label = Gtk::manage(new Gtk::Label("/"));
+
+    Gtk::ListBoxRow* home_row = Gtk::manage(new Gtk::ListBoxRow());
+    home_row->add(*home_label);
+    quick_access_list.append(*home_row);
+
+    Gtk::ListBoxRow* pictures_row = Gtk::manage(new Gtk::ListBoxRow());
+    pictures_row->add(*pictures_label);
+    quick_access_list.append(*pictures_row);
+
+    Gtk::ListBoxRow* root_row = Gtk::manage(new Gtk::ListBoxRow());
+    root_row->add(*root_label);
+    quick_access_list.append(*root_row);
+
+    left_box.pack_start(quick_access_list, Gtk::PACK_EXPAND_WIDGET);
+    quick_access_list.signal_row_selected().connect(
+        sigc::mem_fun(*this, &HyprFilesWindow::on_quick_access_item_selected));
+
+    // File View with Scroll
+    file_list_store = Gtk::ListStore::create(file_columns);
+    file_view.set_model(file_list_store);
+    file_view.append_column("Icon", file_columns.col_icon);
+    file_view.append_column("Name", file_columns.col_name);
+
+    scrolled_window.add(file_view);
+    right_box.pack_start(scrolled_window, Gtk::PACK_EXPAND_WIDGET);
+
+    file_view.signal_row_activated().connect(
+        sigc::mem_fun(*this, &HyprFilesWindow::on_file_row_activated));
+
+    // Dead space for paste
+    paste_dead_space.signal_clicked().connect(sigc::mem_fun(*this, &HyprFilesWindow::on_dead_space_paste));
+    right_box.pack_start(paste_dead_space, Gtk::PACK_SHRINK);
+
+    // Context Menu
+    setup_context_menu();
+
+    // Load the initial directory
+    load_directory(current_directory);
+
+    show_all_children();
+}
+
+void HyprFilesWindow::setup_context_menu() {
+    auto menu_item_copy = Gtk::make_managed<Gtk::MenuItem>("Copy");
+    menu_item_copy->signal_activate().connect(sigc::mem_fun(*this, &HyprFilesWindow::on_menu_copy));
+    context_menu.append(*menu_item_copy);
+
+    auto menu_item_cut = Gtk::make_managed<Gtk::MenuItem>("Cut");
+    menu_item_cut->signal_activate().connect(sigc::mem_fun(*this, &HyprFilesWindow::on_menu_cut));
+    context_menu.append(*menu_item_cut);
+
+    auto menu_item_paste = Gtk::make_managed<Gtk::MenuItem>("Paste");
+    menu_item_paste->signal_activate().connect(sigc::mem_fun(*this, &HyprFilesWindow::on_menu_paste));
+    context_menu.append(*menu_item_paste);
+
+    auto menu_item_undo = Gtk::make_managed<Gtk::MenuItem>("Undo");
+    menu_item_undo->signal_activate().connect(sigc::mem_fun(*this, &HyprFilesWindow::on_menu_undo));
+    context_menu.append(*menu_item_undo);
+
+    auto menu_item_toggle_hidden = Gtk::make_managed<Gtk::MenuItem>("Show Hidden Files");
+    menu_item_toggle_hidden->signal_activate().connect(sigc::mem_fun(*this, &HyprFilesWindow::on_menu_toggle_hidden));
+    context_menu.append(*menu_item_toggle_hidden);
+
+    context_menu.show_all();
+}
+
+void HyprFilesWindow::load_directory(const std::string& path) {
+    current_directory = path;
+    update_file_view();
+}
+
+void HyprFilesWindow::update_file_view() {
+    file_list_store->clear();
+
+    try {
+        for (const auto& entry : fs::directory_iterator(current_directory)) {
+            if (!show_hidden_files && entry.path().filename().string().starts_with("."))
+                continue;
+
+            auto row = *(file_list_store->append());
+            row[file_columns.col_name] = entry.path().filename().string();
+
+            if (entry.is_directory()) {
+                row[file_columns.col_icon] = Gtk::IconTheme::get_default()->load_icon("folder", 24, Gtk::ICON_LOOKUP_USE_BUILTIN);
+                row[file_columns.col_is_dir] = true;
+            } else {
+                row[file_columns.col_icon] = Gtk::IconTheme::get_default()->load_icon("text-x-generic", 24, Gtk::ICON_LOOKUP_USE_BUILTIN);
+                row[file_columns.col_is_dir] = false;
+            }
         }
-
-        _exit(EXIT_FAILURE);  // Exit child if exec fails
-    } else if (pid > 0) {
-        // Parent process: continue with GTK application (non-blocking)
-    } else {
-        std::cerr << "Fork failed!" << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "Error loading directory: " << e.what() << std::endl;
     }
 }
 
-// Function to run system update using pacman
-void system_update() {
-    pid_t pid = fork();
-    if (pid == 0) {
-        // Child process: run the system update
-        execlp("kitty", "kitty", "-e", "sudo", "pacman", "-Syu", (char *)NULL);
-        _exit(EXIT_FAILURE);
+void HyprFilesWindow::on_quick_access_item_selected(Gtk::ListBoxRow* row) {
+    if (!row) return;
+
+    Gtk::Label* label = dynamic_cast<Gtk::Label*>(row->get_child());
+    if (!label) return;
+
+    std::string label_text = label->get_text();
+    if (label_text == "Home") {
+        load_directory(fs::path(getenv("HOME")).string());
+    } else if (label_text == "Pictures") {
+        load_directory(fs::path(getenv("HOME")).append("Pictures").string());
+    } else if (label_text == "/") {
+        load_directory("/");
     }
 }
 
-// Function to launch nwg-look for GTK appearance settings
-void launch_gtk_appearance() {
-    pid_t pid = fork();
-    if (pid == 0) {
-        // Child process: launch nwg-look
-        execlp("nwg-look", "nwg-look", (char *)NULL);
-        _exit(EXIT_FAILURE);
+void HyprFilesWindow::on_file_row_activated(const Gtk::TreeModel::Path& path, Gtk::TreeViewColumn* column) {
+    Gtk::TreeModel::iterator iter = file_list_store->get_iter(path);
+    if (!iter) return;
+
+    Gtk::TreeModel::Row row = *iter;
+    std::string name = row[file_columns.col_name];
+    bool is_dir = row[file_columns.col_is_dir];
+
+    if (is_dir) {
+        load_directory(current_directory + "/" + name);
     }
 }
 
-// Function to launch qt6ct for QT appearance settings
-void launch_qt_appearance() {
-    pid_t pid = fork();
-    if (pid == 0) {
-        // Child process: launch qt6ct
-        execlp("qt6ct", "qt6ct", (char *)NULL);
-        _exit(EXIT_FAILURE);
+void HyprFilesWindow::on_menu_copy() {
+    auto selected_row = file_view.get_selection()->get_selected();
+    if (!selected_row) return;
+
+    Gtk::TreeModel::Row row = *selected_row;
+    clipboard_path = current_directory + "/" + row[file_columns.col_name];
+    clipboard_action = "copy";
+}
+
+void HyprFilesWindow::on_menu_cut() {
+    auto selected_row = file_view.get_selection()->get_selected();
+    if (!selected_row) return;
+
+    Gtk::TreeModel::Row row = *selected_row;
+    clipboard_path = current_directory + "/" + row[file_columns.col_name];
+    clipboard_action = "cut";
+}
+
+void HyprFilesWindow::on_menu_paste() {
+    if (!clipboard_path || clipboard_action.empty()) return;
+
+    try {
+        fs::path destination = current_directory + "/" + clipboard_path->filename().string();
+        if (clipboard_action == "copy") {
+            fs::copy(*clipboard_path, destination, fs::copy_options::recursive);
+        } else if (clipboard_action == "cut") {
+            fs::rename(*clipboard_path, destination);
+            clipboard_path.reset();
+            clipboard_action.clear();
+        }
+        update_file_view();
+    } catch (const std::exception& e) {
+        std::cerr << "Paste operation failed: " << e.what() << std::endl;
     }
 }
 
-// Callback for launching pavucontrol (volume control)
-void launch_volume() {
-    pid_t pid = fork();
-    if (pid == 0) {
-        // Child process: launch pavucontrol
-        execlp("pavucontrol", "pavucontrol", (char *)NULL);
-        _exit(EXIT_FAILURE);
-    }
+void HyprFilesWindow::on_menu_undo() {
+    clipboard_action.clear();
+    clipboard_path.reset();
 }
 
-// Callback for launching gnome-disks (disk management)
-void launch_disk_management() {
-    pid_t pid = fork();
-    if (pid == 0) {
-        // Child process: launch gnome-disks
-        execlp("gnome-disks", "gnome-disks", (char *)NULL);
-        _exit(EXIT_FAILURE);
-    }
+void HyprFilesWindow::on_menu_toggle_hidden() {
+    show_hidden_files = !show_hidden_files;
+    update_file_view();
 }
 
-// Callback for launching gnome-system-monitor (task manager)
-void launch_task_manager() {
-    pid_t pid = fork();
-    if (pid == 0) {
-        // Child process: launch gnome-system-monitor
-        execlp("gnome-system-monitor", "gnome-system-monitor", (char *)NULL);
-        _exit(EXIT_FAILURE);
-    }
+void HyprFilesWindow::on_dead_space_paste() {
+    on_menu_paste();
 }
 
-// Callback for the buttons to launch apps, edit files, etc.
-void on_button_clicked(GtkWidget *widget, gpointer data) {
-    const char *command = static_cast<const char *>(data);
-    launch_app(command);
-}
-
-// Callback for editing config files
-void on_edit_config_clicked(GtkWidget *widget, gpointer data) {
-    const char *config_file = static_cast<const char *>(data);
-    edit_config(config_file);
-}
-
-// Callback for system update button
-void on_system_update_clicked(GtkWidget *widget, gpointer data) {
-    system_update();
-}
-
-// Callback for GTK appearance button
-void on_gtk_appearance_clicked(GtkWidget *widget, gpointer data) {
-    launch_gtk_appearance();
-}
-
-// Callback for QT appearance button
-void on_qt_appearance_clicked(GtkWidget *widget, gpointer data) {
-    launch_qt_appearance();
-}
-
-// Callback for volume button
-void on_volume_clicked(GtkWidget *widget, gpointer data) {
-    launch_volume();
-}
-
-// Callback for disk management button
-void on_disk_management_clicked(GtkWidget *widget, gpointer data) {
-    launch_disk_management();
-}
-
-// Callback for task manager button
-void on_task_manager_clicked(GtkWidget *widget, gpointer data) {
-    launch_task_manager();
-}
-
-int main(int argc, char *argv[]) {
-    gtk_init(&argc, &argv);
-
-    // Create the main window
-    GtkWidget *window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
-    gtk_window_set_title(GTK_WINDOW(window), "HyprMenu");
-    gtk_window_set_default_size(GTK_WINDOW(window), 400, 300);
-    g_signal_connect(window, "destroy", G_CALLBACK(gtk_main_quit), NULL);
-
-    // Create a notebook widget (for tabs)
-    GtkWidget *notebook = gtk_notebook_new();
-    gtk_container_add(GTK_CONTAINER(window), notebook);
-
-    // ==== Applications Tab ====
-    GtkWidget *applications_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
-    GtkWidget *launcher_button = gtk_button_new_with_label("Launcher");
-    GtkWidget *browser_button = gtk_button_new_with_label("Browser");
-    GtkWidget *obs_button = gtk_button_new_with_label("OBS");
-    GtkWidget *nautilus_button = gtk_button_new_with_label("Files");
-    GtkWidget *terminal_button = gtk_button_new_with_label("Terminal");
-    
-    // Connect buttons to commands (non-blocking)
-    g_signal_connect(launcher_button, "clicked", G_CALLBACK(on_button_clicked), (gpointer) "lutris");
-    g_signal_connect(browser_button, "clicked", G_CALLBACK(on_button_clicked), (gpointer) "firefox");
-    g_signal_connect(obs_button, "clicked", G_CALLBACK(on_button_clicked), (gpointer) "obs");
-    g_signal_connect(nautilus_button, "clicked", G_CALLBACK(on_button_clicked), (gpointer) "nautilus");
-    g_signal_connect(terminal_button, "clicked", G_CALLBACK(on_button_clicked), (gpointer) "kitty");
-
-    // Add buttons to the Applications tab
-    gtk_box_pack_start(GTK_BOX(applications_box), launcher_button, TRUE, TRUE, 0);
-    gtk_box_pack_start(GTK_BOX(applications_box), browser_button, TRUE, TRUE, 0);
-    gtk_box_pack_start(GTK_BOX(applications_box), obs_button, TRUE, TRUE, 0);
-    gtk_box_pack_start(GTK_BOX(applications_box), nautilus_button, TRUE, TRUE, 0);
-    gtk_box_pack_start(GTK_BOX(applications_box), terminal_button, TRUE, TRUE, 0);
-     
-    // Add Applications tab to the notebook
-    GtkWidget *applications_label = gtk_label_new("Applications");
-    gtk_notebook_append_page(GTK_NOTEBOOK(notebook), applications_box, applications_label);
-
-    // ==== Edit Configs Tab ====
-    GtkWidget *configs_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
-
-    GtkWidget *hyprland_button = gtk_button_new_with_label("Hyprland");
-    GtkWidget *hyprpaper_button = gtk_button_new_with_label("Hyprpaper");
-    GtkWidget *waybar_config_button = gtk_button_new_with_label("WayConfig");
-    GtkWidget *waybar_style_button = gtk_button_new_with_label("WayStyle");
-    GtkWidget *kitty_button_config = gtk_button_new_with_label("Terminal");
-
-    // Connect buttons to edit config files
-    g_signal_connect(hyprland_button, "clicked", G_CALLBACK(on_edit_config_clicked), (gpointer) ".config/hypr/hyprland.conf");
-    g_signal_connect(hyprpaper_button, "clicked", G_CALLBACK(on_edit_config_clicked), (gpointer) ".config/hypr/hyprpaper.conf");
-    g_signal_connect(waybar_config_button, "clicked", G_CALLBACK(on_edit_config_clicked), (gpointer) ".config/waybar/waybar.conf");
-    g_signal_connect(waybar_style_button, "clicked", G_CALLBACK(on_edit_config_clicked), (gpointer) ".config/waybar/style.css");
-    g_signal_connect(kitty_button_config, "clicked", G_CALLBACK(on_edit_config_clicked), (gpointer) ".config/kitty/kitty.conf");
-
-    // Add buttons to the Configs tab
-    gtk_box_pack_start(GTK_BOX(configs_box), hyprland_button, TRUE, TRUE, 0);
-    gtk_box_pack_start(GTK_BOX(configs_box), hyprpaper_button, TRUE, TRUE, 0);
-    gtk_box_pack_start(GTK_BOX(configs_box), waybar_config_button, TRUE, TRUE, 0);
-    gtk_box_pack_start(GTK_BOX(configs_box), waybar_style_button, TRUE, TRUE, 0);
-    gtk_box_pack_start(GTK_BOX(configs_box), kitty_button_config, TRUE, TRUE, 0);
-     
-    // Add Configs tab to the notebook
-    GtkWidget *configs_label = gtk_label_new("Edit Configs");
-    gtk_notebook_append_page(GTK_NOTEBOOK(notebook), configs_box, configs_label);
-
-    // ==== System Management Tab ====
-    GtkWidget *system_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
-    
-    GtkWidget *update_button = gtk_button_new_with_label("Update System");
-    GtkWidget *gtk_button = gtk_button_new_with_label("GTK Appearance");
-    GtkWidget *qt_button = gtk_button_new_with_label("QT Appearance");
-    GtkWidget *volume_button = gtk_button_new_with_label("Volume Control");
-    GtkWidget *disk_button = gtk_button_new_with_label("Disk Management");
-    GtkWidget *task_button = gtk_button_new_with_label("Task Manager");
-
-    // Connect buttons to their corresponding functions
-    g_signal_connect(update_button, "clicked", G_CALLBACK(on_system_update_clicked), NULL);
-    g_signal_connect(gtk_button, "clicked", G_CALLBACK(on_gtk_appearance_clicked), NULL);
-    g_signal_connect(qt_button, "clicked", G_CALLBACK(on_qt_appearance_clicked), NULL);
-    g_signal_connect(volume_button, "clicked", G_CALLBACK(on_volume_clicked), NULL);
-    g_signal_connect(disk_button, "clicked", G_CALLBACK(on_disk_management_clicked), NULL);
-    g_signal_connect(task_button, "clicked", G_CALLBACK(on_task_manager_clicked), NULL);
-
-    // Add buttons to the System Management tab
-    gtk_box_pack_start(GTK_BOX(system_box), update_button, TRUE, TRUE, 0);
-    gtk_box_pack_start(GTK_BOX(system_box), gtk_button, TRUE, TRUE, 0);
-    gtk_box_pack_start(GTK_BOX(system_box), qt_button, TRUE, TRUE, 0);
-    gtk_box_pack_start(GTK_BOX(system_box), volume_button, TRUE, TRUE, 0);
-    gtk_box_pack_start(GTK_BOX(system_box), disk_button, TRUE, TRUE, 0);
-    gtk_box_pack_start(GTK_BOX(system_box), task_button, TRUE, TRUE, 0);
-
-    // Add System Management tab to the notebook
-    GtkWidget *system_label = gtk_label_new("System Management");
-    gtk_notebook_append_page(GTK_NOTEBOOK(notebook), system_box, system_label);
-
-    // ==== System Information Tab ====
-    GtkWidget *info_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
-    
-    // Create a label to display system information
-    GtkWidget *info_label = gtk_label_new(get_system_info().c_str());
-
-    // Set line spacing and margin to make it more compact
-    gtk_widget_set_margin_top(info_label, 5);
-    gtk_widget_set_margin_bottom(info_label, 5);
-    gtk_widget_set_margin_start(info_label, 5);
-    gtk_widget_set_margin_end(info_label, 5);
-    gtk_label_set_line_wrap(GTK_LABEL(info_label), TRUE);
-    gtk_label_set_line_wrap_mode(GTK_LABEL(info_label), PANGO_WRAP_WORD_CHAR);
-    gtk_label_set_ellipsize(GTK_LABEL(info_label), PANGO_ELLIPSIZE_END);
-
-    // Add info label to the System Information tab
-    gtk_box_pack_start(GTK_BOX(info_box), info_label, TRUE, TRUE, 0);
-
-    // Add System Information tab to the notebook
-    GtkWidget *info_tab_label = gtk_label_new("System Information");
-    gtk_notebook_append_page(GTK_NOTEBOOK(notebook), info_box, info_tab_label);
-
-    // Show all widgets in the window
-    gtk_widget_show_all(window);
-
-    // Main GTK loop
-    gtk_main();
-    return 0;
+int main(int argc, char* argv[]) {
+    auto app = Gtk::Application::create(argc, argv, "org.hyprfiles.filemanager");
+    HyprFilesWindow window;
+    return app->run(window);
 }
 
